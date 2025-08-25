@@ -80,6 +80,26 @@
     }
 )
 
+;; Investor portfolio
+(define-map investor-portfolios
+    principal
+    {
+        total-invested: uint,
+        active-campaigns: uint,
+        total-returns: uint,
+    }
+)
+
+;; Campaign statistics
+(define-map campaign-stats
+    uint
+    {
+        total-investors: uint,
+        average-investment: uint,
+        last-update: uint,
+    }
+)
+
 ;; Read-only functions
 (define-read-only (get-campaign-details (campaign-id uint))
     (map-get? campaigns campaign-id)
@@ -150,6 +170,15 @@
     )
 )
 
+;; Portfolio and statistics read-only functions
+(define-read-only (get-investor-portfolio (investor principal))
+    (map-get? investor-portfolios investor)
+)
+
+(define-read-only (get-campaign-stats (campaign-id uint))
+    (map-get? campaign-stats campaign-id)
+)
+
 ;; Private functions
 (define-private (calculate-platform-fee (amount uint))
     (/ (* amount (var-get platform-fee-percentage)) u10000)
@@ -189,6 +218,11 @@
                 active: true,
                 completed: false,
                 milestone-count: milestone-count,
+            })
+            (map-set campaign-stats campaign-id {
+                total-investors: u0,
+                average-investment: u0,
+                last-update: stacks-block-height,
             })
             (var-set total-campaigns campaign-id)
             (ok campaign-id)
@@ -250,6 +284,45 @@
                 timestamp: stacks-block-height,
                 equity-tokens: (+ (get equity-tokens existing-investment) equity-tokens),
             })
+            ;; Update investor portfolio
+            (let ((portfolio (default-to {
+                    total-invested: u0,
+                    active-campaigns: u0,
+                    total-returns: u0,
+                }
+                    (map-get? investor-portfolios tx-sender)
+                )))
+                (map-set investor-portfolios tx-sender
+                    (merge portfolio {
+                        total-invested: (+ (get total-invested portfolio) investment-amount),
+                        active-campaigns: (if (is-eq (get amount existing-investment) u0)
+                            (+ (get active-campaigns portfolio) u1)
+                            (get active-campaigns portfolio)
+                        ),
+                    })
+                )
+            )
+            ;; Update campaign statistics
+            (let ((current-stats (default-to {
+                    total-investors: u0,
+                    average-investment: u0,
+                    last-update: u0,
+                }
+                    (map-get? campaign-stats campaign-id)
+                )))
+                (let ((new-investor-count (if (is-eq (get amount existing-investment) u0)
+                        (+ (get total-investors current-stats) u1)
+                        (get total-investors current-stats)
+                    )))
+                    (map-set campaign-stats campaign-id {
+                        total-investors: new-investor-count,
+                        average-investment: (/ (+ (get total-raised campaign) investment-amount)
+                            new-investor-count
+                        ),
+                        last-update: stacks-block-height,
+                    })
+                )
+            )
             ;; Update platform fees
             (var-set total-platform-fees
                 (+ (var-get total-platform-fees) platform-fee)
@@ -412,6 +485,72 @@
             (asserts! (>= approval-rate u51) err-milestone-not-completed) ;; Need >50% approval
             (asserts! (not (get funds-released milestone)) err-invalid-parameter)
             ;; Mark milestone as completed
+            (map-set campaign-milestones {
+                campaign-id: campaign-id,
+                milestone-id: milestone-id,
+            }
+                (merge milestone {
+                    completed: true,
+                    funds-released: true,
+                })
+            )
+            (ok true)
+        )
+    )
+)
+
+;; Administrative functions
+(define-public (set-platform-fee (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts! (<= new-fee u1000) err-invalid-parameter) ;; Max 10%
+        (var-set platform-fee-percentage new-fee)
+        (ok true)
+    )
+)
+
+(define-public (toggle-pause)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (var-set paused (not (var-get paused)))
+        (ok true)
+    )
+)
+
+(define-public (withdraw-platform-fees)
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (let ((fees (var-get total-platform-fees)))
+            (var-set total-platform-fees u0)
+            (stx-transfer? fees tx-sender contract-owner)
+        )
+    )
+)
+
+;; Emergency functions
+(define-public (emergency-close-campaign (campaign-id uint))
+    (let ((campaign (unwrap! (map-get? campaigns campaign-id) err-campaign-not-found)))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+            (map-set campaigns campaign-id (merge campaign { active: false }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (force-milestone-completion
+        (campaign-id uint)
+        (milestone-id uint)
+    )
+    (let ((milestone (unwrap!
+            (map-get? campaign-milestones {
+                campaign-id: campaign-id,
+                milestone-id: milestone-id,
+            })
+            err-milestone-not-found
+        )))
+        (begin
+            (asserts! (is-eq tx-sender contract-owner) err-owner-only)
             (map-set campaign-milestones {
                 campaign-id: campaign-id,
                 milestone-id: milestone-id,
